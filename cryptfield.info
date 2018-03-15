@@ -1,0 +1,3 @@
+name = CryptField
+description = Encrypt field values at the field sql storage level
+core = 7.x

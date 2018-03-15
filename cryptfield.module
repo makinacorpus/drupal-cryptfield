@@ -1,0 +1,593 @@
+<?php
+/**
+ * CryptField module.
+ *
+ * Mostly using secret-key authenticated encryption, please read:
+ *   https://paragonie.com/book/pecl-libsodium/read/04-secretkey-crypto.md
+ *
+ * Don't worry for SODIUM_CRYPTO_* undefined constants it is defined but
+ * dynamically, hence the lack of IDE autocompletion and code navigation.
+ */
+
+/**
+ * Single message for multiple errors, avoid information leakage.
+ */
+const CRYPTFIELD_KEY_LOAD_ERROR = "Could not read or generate CryptField private key";
+
+/**
+ * Implements hook_field_storage_info().
+ */
+function cryptfield_field_storage_info() {
+  return [
+    'cryptfield' => [
+      'label' => t("Encrypted SQL storage"),
+      'description' => t("Stores fields in the local SQL database, encrypted."),
+    ],
+  ];
+}
+
+/**
+ * Default private key path
+ *
+ * @return string
+ */
+function cryptfield_secretbox_key_path() {
+  return variable_get('cryptfield_key_path', 'private://cryptfield.key');
+}
+
+/**
+ * Key in use to decrypt the key, pretty much stupid duh, but one lies
+ * within variables, and the other on the file system: one without the
+ * other cannot be used.
+ *
+ * @return string
+ */
+function cryptfield_secretbox_key_key() {
+  if (!$key = variable_get('cryptfield_secretbox_key_key')) {
+    variable_set('cryptfield_secretbox_key_key', $key = random_bytes(SODIUM_CRYPTO_SECRETBOX_KEYBYTES));
+  }
+  return $key;
+}
+
+/**
+ * Generate a private key if none found
+ *
+ * @return string
+ *   Encrypted key using cryptfield_secretbox_key_key() as key, and
+ *   cryptfield_configuration_nonce_get() as nonce.
+ */
+function cryptfield_secretbox_key_generate() {
+
+  // Encrypt key with drupal private key
+  $encrypted_key = sodium_crypto_secretbox(
+    // Generate random key
+    sodium_crypto_secretbox_keygen(SODIUM_CRYPTO_SECRETBOX_KEYBYTES),
+    cryptfield_configuration_nonce_get(),
+    cryptfield_secretbox_key_key()
+  );
+
+  // Erase any errors to avoid the path leak to front
+  if (!@file_put_contents(cryptfield_secretbox_key_path(), $encrypted_key)) {
+    throw new \Exception(CRYPTFIELD_KEY_LOAD_ERROR);
+  }
+
+  return $encrypted_key;
+}
+
+/**
+ * Get nonce/iv/salt for configuration
+ */
+function cryptfield_configuration_nonce_get() {
+  // Using environment variable ensures that nonce and Drupal private key
+  // are not stored at the same place.
+  if (!$nonce = getenv('CRYPTFIELD_NONCE')) {
+    if (!$nonce = variable_get('cryptfield_configuration_nonce')) {
+      variable_set(
+        'cryptfield_configuration_nonce',
+        $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES)
+      );
+    }
+  }
+  return $nonce;
+}
+
+/**
+ * Fetches the private key
+ *
+ * @return string
+ */
+function cryptfield_secretbox_key_get() {
+
+  // Use static and not drupal_static() may avoid leakage, in-memory key is
+  // an encrypted version of it, so even if memory leaks, you need the nonce
+  // and the Drupal private key to decipher it.
+  static $encrypted_key;
+
+  if (!$encrypted_key) {
+    $filename = cryptfield_secretbox_key_path();
+
+    if (!file_exists($filename)) {
+      $encrypted_key = cryptfield_secretbox_key_generate();
+    } else {
+      $encrypted_key = file_get_contents($filename);
+    }
+
+    // We DO need the key for STORING data as weel, we cannot proceed further
+    // without have a valid key.
+    if (!$encrypted_key) {
+      throw new \Exception(CRYPTFIELD_KEY_LOAD_ERROR);
+    }
+  }
+
+  $key = sodium_crypto_secretbox_open($encrypted_key, cryptfield_configuration_nonce_get(), cryptfield_secretbox_key_key());
+
+  // Key is still mandatory, see upper comment.
+  if (!$key) {
+    throw new \Exception(CRYPTFIELD_KEY_LOAD_ERROR);
+  }
+
+  return $key;
+}
+
+/* ****************************************************************************
+ *
+ * BELOW THIS LINE LIES FIELD STORAGE CUSTOM CODE
+ *
+ * ****************************************************************************/
+
+/**
+ * Get table name for a field
+ *
+ * @param array $field
+ *
+ * @return string
+ */
+function cryptfield_table_revision_name_get($field) {
+  if ($field['deleted']) {
+    return "cryptfield_deleted_{$field['id']}_revision";
+  } else {
+    return "cryptfield_{$field['field_name']}_revision";
+  }
+}
+
+/**
+ * Get revision table name for a field
+ *
+ * @param array $field
+ *
+ * @return string
+ */
+function cryptfield_table_name_get($field) {
+  if ($field['deleted']) {
+    return "cryptfield_deleted_{$field['id']}";
+  } else {
+    return "cryptfield_{$field['field_name']}";
+  }
+}
+
+/**
+ * Basically more or less the same as _field_sql_storage_schema() except that
+ * we do replace all column fields using a single blob entry that will contain
+ * the encrypted data.
+ *
+ * @param array $field
+ *   The field structure for which to generate a database schema.
+ *
+ * @return array
+ *   One or more tables representing the schema for the field.
+ */
+function _cryptfield_schema($field) {
+  $current = [
+    'fields' => [
+      'entity_type' => [
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => true,
+        'default' => '',
+      ],
+      'bundle' => [
+        'type' => 'varchar',
+        'length' => 128,
+        'not null' => true,
+        'default' => '',
+      ],
+      'deleted' => [
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => true,
+        'default' => 0,
+      ],
+      'entity_id' => [
+        'type' => 'int',
+        'unsigned' => true,
+        'not null' => true,
+      ],
+      'revision_id' => [
+        'type' => 'int',
+        'unsigned' => true,
+        'not null' => false,
+      ],
+      'language' => [
+        'type' => 'varchar',
+        'length' => 32,
+        'not null' => true,
+        'default' => '',
+      ],
+      'delta' => [
+        'type' => 'int',
+        'unsigned' => true,
+        'not null' => true,
+      ],
+      'nonce' => [
+        'type' => 'text',
+        'default' => null,
+      ],
+      'data' => [
+        'type' => 'text',
+        'default' => null,
+      ],
+    ],
+    'primary key' => ['entity_type', 'entity_id', 'deleted', 'delta', 'language'],
+    'indexes' => [
+      'entity_type' => ['entity_type'],
+      'bundle' => ['bundle'],
+      'deleted' => ['deleted'],
+      'entity_id' => ['entity_id'],
+      'revision_id' => ['revision_id'],
+      'language' => ['language'],
+    ],
+  ];
+
+  // Construct the revision table.
+  $revision = $current;
+  $revision['primary key'] = ['entity_type', 'entity_id', 'revision_id', 'deleted', 'delta', 'language'];
+  $revision['fields']['revision_id']['not null'] = true;
+
+  return [
+    cryptfield_table_name_get($field) => $current,
+    cryptfield_table_revision_name_get($field) => $revision,
+  ];
+}
+
+/**
+ * Implements hook_field_storage_update_field().
+ *
+ * In opposition to core, we don't support transactions, if DDL transactions
+ * were to be supported by the backend, this would, in theory, be handled by
+ * the calling call (it's not this module responsability to create the
+ * transaction, but Drush, for example, will do it within update functions).
+ */
+function cryptfield_field_storage_update_field($field, $prior_field, $has_data) {
+  if (!$has_data) {
+    $prior_schema = _cryptfield_schema($prior_field);
+    foreach ($prior_schema as $name => $table) {
+      db_drop_table($name, $table);
+    }
+    $schema = _cryptfield_schema($field);
+    foreach ($schema as $name => $table) {
+      db_create_table($name, $table);
+    }
+  }
+  drupal_get_schema(null, true);
+}
+
+/**
+ * Implements hook_field_storage_load().
+ */
+function cryptfield_field_storage_load($entity_type, $entities, $age, $fields, $options) {
+  $load_current = $age == FIELD_LOAD_CURRENT;
+
+  // For performance (will be zero'd at the end of the function).
+  $criptfield_key = cryptfield_secretbox_key_key();
+
+  try {
+    foreach ($fields as $field_id => $ids) {
+      // By the time this hook runs, the relevant field definitions have been
+      // populated and cached in FieldInfo, so calling field_info_field_by_id()
+      // on each field individually is more efficient than loading all fields in
+      // memory upfront with field_info_field_by_ids().
+      $field = field_info_field_by_id($field_id);
+      $field_name = $field['field_name'];
+      $table = $load_current ? cryptfield_table_name_get($field) : cryptfield_table_revision_name_get($field);
+
+      $query = db_select($table, 't')
+        ->fields('t')
+        ->condition('entity_type', $entity_type)
+        ->condition($load_current ? 'entity_id' : 'revision_id', $ids, 'IN')
+        ->condition('language', field_available_languages($entity_type, $field), 'IN')
+        ->orderBy('delta');
+
+      if (empty($options['deleted'])) {
+        $query->condition('deleted', 0);
+      }
+
+      $results = $query->execute();
+
+      $delta = [];
+      foreach ($results as $row) {
+        $item = null;
+
+        if ($row->data && $row->nonce) {
+          $text = sodium_crypto_secretbox_open(base64_decode($row->data), base64_decode($row->nonce), $criptfield_key);
+          if ($data = @unserialize($text)) {
+            $item = array_intersect_key($data, $field['columns']);
+          }
+        }
+
+        $delta = $delta[$row->entity_id][$row->language]++;
+
+        if (!$item) {
+          watchdog(__FUNCTION__, sprintf("Unable to read data for field '%s' entity type '%s', with id '%s' and delta %d", $field_name, $row->entity_type, $row->entity_id, $delta));
+          $item = []; // Avoid later PHP warnings when loading data
+          foreach (array_keys($field['columns']) as $key) {
+            $item[$key] = null;
+          }
+        }
+
+        $entities[$row->entity_id]->{$field_name}[$row->language][] = $item;
+      }
+    }
+  } finally {
+    // sodium_memzero($criptfield_key);
+  }
+}
+
+/**
+ * Implements hook_field_storage_write().
+ */
+function cryptfield_field_storage_write($entity_type, $entity, $op, $fields) {
+  list($id, $vid, $bundle) = entity_extract_ids($entity_type, $entity);
+  if (!isset($vid)) {
+    $vid = $id;
+  }
+
+  // For performance (will be zero'd at the end of the function).
+  $criptfield_key = cryptfield_secretbox_key_key();
+
+  try {
+    foreach ($fields as $field_id) {
+      $field = field_info_field_by_id($field_id);
+      $field_name = $field['field_name'];
+      $table_name = cryptfield_table_name_get($field);
+      $revision_name = cryptfield_table_revision_name_get($field);
+
+      $all_languages = field_available_languages($entity_type, $field);
+      $field_languages = array_intersect($all_languages, array_keys((array) $entity->$field_name));
+
+      // Delete and insert, rather than update, in case a value was added.
+      if ($op == FIELD_STORAGE_UPDATE) {
+        // Delete languages present in the incoming $entity->$field_name.
+        // Delete all languages if $entity->$field_name is empty.
+        $languages = !empty($entity->$field_name) ? $field_languages : $all_languages;
+        if ($languages) {
+          db_delete($table_name)
+            ->condition('entity_type', $entity_type)
+            ->condition('entity_id', $id)
+            ->condition('language', $languages, 'IN')
+            ->execute();
+          db_delete($revision_name)
+            ->condition('entity_type', $entity_type)
+            ->condition('entity_id', $id)
+            ->condition('revision_id', $vid)
+            ->condition('language', $languages, 'IN')
+            ->execute();
+        }
+      }
+
+      // Prepare the multi-insert query.
+      $do_insert = false;
+      $columns = array('entity_type', 'entity_id', 'revision_id', 'bundle', 'delta', 'language', 'nonce', 'data');
+      $query = db_insert($table_name)->fields($columns);
+      $revision_query = db_insert($revision_name)->fields($columns);
+
+      foreach ($field_languages as $langcode) {
+        $items = (array) $entity->{$field_name}[$langcode];
+        $delta_count = 0;
+        foreach ($items as $delta => $item) {
+          // We now know we have someting to insert.
+          $do_insert = true;
+          $record = array(
+            'entity_type' => $entity_type,
+            'entity_id' => $id,
+            'revision_id' => $vid,
+            'bundle' => $bundle,
+            'delta' => $delta,
+            'language' => $langcode,
+            'nonce' => base64_encode($nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES)),
+            'data' => $item ? base64_encode(sodium_crypto_secretbox(serialize(array_intersect_key($item, $field['columns'])), $nonce, $criptfield_key)) : null,
+          );
+
+          $query->values($record);
+          if (isset($vid)) {
+            $revision_query->values($record);
+          }
+
+          if ($field['cardinality'] != FIELD_CARDINALITY_UNLIMITED && ++$delta_count == $field['cardinality']) {
+            break;
+          }
+        }
+      }
+
+      // Execute the query if we have values to insert.
+      if ($do_insert) {
+        $query->execute();
+        $revision_query->execute();
+      }
+    }
+  } finally {
+    // sodium_memzero($criptfield_key);
+  }
+}
+
+/**
+ * Implements hook_field_storage_details().
+ */
+function cryptfield_field_storage_details($field) {
+  return [];
+}
+
+/**
+ * Implements hook_field_storage_query().
+ */
+function cryptfield_field_storage_query(EntityFieldQuery $query) {
+  throw new EntityFieldQueryException("CryptField cannot query within encrypted data!");
+}
+
+/* ****************************************************************************
+ *
+ * BELOW THIS LINE LIES MOSTLY COPY/PASTED CODE FROM CORE
+ * (minus some basic reformating and a few function name changes)
+ *
+ * ****************************************************************************/
+
+/**
+ * Implements hook_field_storage_create_field().
+ *
+ * Basically a copy/paste of core default field storage.
+ */
+function cryptfield_field_storage_create_field($field) {
+  $schema = _cryptfield_schema($field);
+  foreach ($schema as $name => $table) {
+    db_create_table($name, $table);
+  }
+  drupal_get_schema(null, true);
+}
+
+/**
+ * Implements hook_field_update_forbid().
+ *
+ * Basically a copy/paste of core default field storage.
+ */
+function cryptfield_field_update_forbid($field, $prior_field, $has_data) {
+  if ($has_data && $field['columns'] != $prior_field['columns']) {
+    throw new FieldUpdateForbiddenException("field_sql_storage cannot change the schema for an existing field with data.");
+  }
+}
+
+/**
+ * Implements hook_field_storage_delete_field().
+ *
+ * Basically a copy/paste of core default field storage.
+ */
+function cryptfield_field_storage_delete_field($field) {
+  // Mark all data associated with the field for deletion.
+  $field['deleted'] = 0;
+  $table = cryptfield_table_name_get($field);
+  $revision_table = cryptfield_table_revision_name_get($field);
+  db_update($table)
+    ->fields(array('deleted' => 1))
+    ->execute();
+
+  // Move the table to a unique name while the table contents are being deleted.
+  $field['deleted'] = 1;
+  $new_table = cryptfield_table_name_get($field);
+  $revision_new_table = cryptfield_table_revision_name_get($field);
+  db_rename_table($table, $new_table);
+  db_rename_table($revision_table, $revision_new_table);
+  drupal_get_schema(null, true);
+}
+
+/**
+ * Implements hook_field_storage_delete().
+ *
+ * Basically a copy/paste of core default field storage.
+ */
+function cryptfield_field_storage_delete($entity_type, $entity, $fields) {
+  list(,, $bundle) = entity_extract_ids($entity_type, $entity);
+  foreach (field_info_instances($entity_type, $bundle) as $instance) {
+    if (isset($fields[$instance['field_id']])) {
+      $field = field_info_field_by_id($instance['field_id']);
+      field_sql_storage_field_storage_purge($entity_type, $entity, $field, $instance);
+    }
+  }
+}
+
+/**
+ * Implements hook_field_storage_purge().
+ *
+ * Basically a copy/paste of core default field storage.
+ */
+function cryptfield_field_storage_purge($entity_type, $entity, $field, $instance) {
+  list($id) = entity_extract_ids($entity_type, $entity);
+  db_delete(cryptfield_table_name_get($field))
+    ->condition('entity_type', $entity_type)
+    ->condition('entity_id', $id)
+    ->execute();
+  db_delete(cryptfield_table_revision_name_get($field))
+    ->condition('entity_type', $entity_type)
+    ->condition('entity_id', $id)
+    ->execute();
+}
+
+/**
+ * Implements hook_field_storage_delete_revision().
+ *
+ * Basically a copy/paste of core default field storage.
+ */
+function cryptfield_field_storage_delete_revision($entity_type, $entity, $fields) {
+  list($id, $vid) = entity_extract_ids($entity_type, $entity);
+  if (isset($vid)) {
+    foreach ($fields as $field_id) {
+      $field = field_info_field_by_id($field_id);
+      db_delete(cryptfield_table_revision_name_get($field))
+        ->condition('entity_type', $entity_type)
+        ->condition('entity_id', $id)
+        ->condition('revision_id', $vid)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_field_storage_delete_instance().
+ *
+ * Basically a copy/paste of core default field storage.
+ */
+function cryptfield_field_storage_delete_instance($instance) {
+  $field = field_info_field($instance['field_name']);
+  db_update(cryptfield_table_name_get($field))
+    ->fields(['deleted' => 1])
+    ->condition('entity_type', $instance['entity_type'])
+    ->condition('bundle', $instance['bundle'])
+    ->execute();
+  db_update(cryptfield_table_revision_name_get($field))
+    ->fields(['deleted' => 1])
+    ->condition('entity_type', $instance['entity_type'])
+    ->condition('bundle', $instance['bundle'])
+    ->execute();
+}
+
+/**
+ * Implements hook_field_attach_rename_bundle().
+ *
+ * Basically a copy/paste of core default field storage.
+ */
+function cryptfield_field_attach_rename_bundle($entity_type, $bundle_old, $bundle_new) {
+  // We need to account for deleted or inactive fields and instances.
+  $instances = field_read_instances(['entity_type' => $entity_type, 'bundle' => $bundle_new], ['include_deleted' => true, 'include_inactive' => true]);
+  foreach ($instances as $instance) {
+    $field = field_info_field_by_id($instance['field_id']);
+    if ($field['storage']['type'] == 'field_sql_storage') {
+      db_update(cryptfield_table_name_get($field))
+        ->fields(['bundle' => $bundle_new])
+        ->condition('entity_type', $entity_type)
+        ->condition('bundle', $bundle_old)
+        ->execute();
+      db_update(cryptfield_table_revision_name_get($field))
+        ->fields(['bundle' => $bundle_new])
+        ->condition('entity_type', $entity_type)
+        ->condition('bundle', $bundle_old)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_field_storage_purge_field().
+ *
+ * Basically a copy/paste of core default field storage.
+ */
+function cryptfield_field_storage_purge_field($field) {
+  db_drop_table(cryptfield_table_name_get($field));
+  db_drop_table(cryptfield_table_revision_name_get($field));
+}
